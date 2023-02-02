@@ -101,6 +101,9 @@ class VmwareCollector():
             'datastores': ['ds_name', 'dc_name', 'ds_cluster'],
             'hosts': ['host_name', 'dc_name', 'cluster_name'],
             'host_perf': ['host_name', 'dc_name', 'cluster_name'],
+            'host_perf_storage': ['host_name', 'dc_name', 'cluster_name', 'device'],
+            'host_perf_datastore': ['host_name', 'dc_name', 'cluster_name', 'datastore'],
+            'host_perf_adapter': ['host_name', 'dc_name', 'cluster_name', 'interface'],
         }
 
         # if tags are gonna be fetched 'tags' will be a label too
@@ -115,6 +118,9 @@ class VmwareCollector():
             'vm_perf': [],
             'hosts': [],
             'host_perf': [],
+            'host_perf_storage': [],
+            'host_perf_datastore': [],
+            'host_perf_adapter': [],
             'datastores': [],
         }
 
@@ -426,6 +432,9 @@ class VmwareCollector():
         if collect_only['hosts'] is True:
             tasks.append(self._vmware_get_hosts(metrics))
             tasks.append(self._vmware_get_host_perf_manager_metrics(metrics))
+            tasks.append(self._vmware_get_host_perf_storage_metrics(metrics))
+            tasks.append(self._vmware_get_host_perf_datastore_metrics(metrics))
+            tasks.append(self._vmware_get_host_perf_adapter_metrics(metrics))
 
         yield parallelize(*tasks)
 
@@ -1322,6 +1331,7 @@ class VmwareCollector():
         # List of performance counter we want
         perf_list = [
             'cpu.ready.summation',
+            'cpu.readiness.average',
             'cpu.maxlimited.summation',
             'cpu.usage.average',
             'cpu.usagemhz.average',
@@ -1489,6 +1499,280 @@ class VmwareCollector():
                     )
 
         logging.info('FIN: _vmware_get_host_perf_manager_metrics')
+
+    @defer.inlineCallbacks
+    def _vmware_get_host_perf_storage_metrics(self, host_metrics):
+        logging.info('START: _vmware_get_host_perf_storage_metrics')
+
+        host_systems, counter_info = yield parallelize(self.host_system_inventory, self.counter_ids)
+
+        # List of performance counter we want
+        perf_list = [
+            'disk.deviceReadLatency.average',
+            'disk.deviceWriteLatency.average',
+            'disk.deviceLatency.average',
+            'storagePath.read.average',
+            'storagePath.write.average',
+            'storagePath.totalReadLatency.average',
+            'storagePath.totalWriteLatency.average',
+            # 'datastore.read.average',
+            # 'datastore.write.average',
+            # 'storageAdapter.totalReadLatency.average',
+            # 'storageAdapter.totalWriteLatency.average',
+            # 'datastore.datastoreNormalReadLatency.latest',
+            # 'datastore.datastoreNormalWriteLatency.latest',
+            # 'storageAdapter.queueDepth.average'
+        ]
+
+        # logging.info("Prometheus metrics[before]: {metrics}".format(metrics=host_metrics))
+
+ #       logging.info("Preparing gauges")
+        # Prepare gauges
+        for p in perf_list:
+            p_metric = 'vmware_host_' + p.replace('.', '_')
+            host_metrics[p_metric] = GaugeMetricFamily(
+                p_metric,
+                p_metric,
+                labels=self._labelNames['host_perf_storage'])
+            self._metricNames['host_perf_storage'].append(p_metric)
+
+        # logging.info("Listing out metrics in the host_metrics[] array")
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+        # # logging.info("Metric names: {name}".format(name=self._metricNames['host_perf_storage']))
+
+        metrics = []
+        metric_names = {}
+        for perf_metric in perf_list:
+            perf_metric_name = 'vmware_host_' + perf_metric.replace('.', '_')
+            counter_key = counter_info[perf_metric]
+            metrics.append(vim.PerformanceManager.MetricId(
+            counterId=counter_key,
+            instance='*'
+            ))
+            metric_names[counter_key] = perf_metric_name
+
+        # logging.info("Metric names: {names}".format(names=metric_names))
+
+        # Insert custom attributes names as metric labels
+        self.updateMetricsLabelNames(host_metrics, ['host_perf_storage'])
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+
+        specs = []
+        for host in host_systems.values():
+            if host.get('runtime.powerState') != 'poweredOn':
+                continue
+            specs.append(vim.PerformanceManager.QuerySpec(
+                maxSample=1,
+                entity=host['obj'],
+                metricId=metrics,
+                intervalId=20
+            ))
+
+        # logging.info("Specs are: {specs}".format(specs=specs))
+        content = yield self.content
+
+        if len(specs) > 0:
+            results, labels = yield parallelize(
+                threads.deferToThread(content.perfManager.QueryStats, querySpec=specs),
+                self.host_labels,
+            )
+
+            # logging.info("Labels: {labels}".format(labels=labels))
+
+            # logging.info("results: {results}".format(results=results))
+            for ent in results:
+                for metric in ent.value:
+                    # logging.info("{hostname}: {name} {value}".format(hostname=ent.entity._moId, name=metric_names[metric.id.counterId], value=metric.value))
+                    # logging.info("{hostname}: {labels}".format(hostname=ent.entity._moId, labels=labels[ent.entity._moId]))
+                    # logging.info("{hostname}: {lun}".format(hostname=ent.entity._moId, lun=metric.id.instance))
+                    host_metrics[metric_names[metric.id.counterId]].add_metric(
+                        labels[ent.entity._moId] + [metric.id.instance],
+                        float(sum(metric.value)),
+                    )
+
+        logging.info('FIN: _vmware_get_host_perf_storage_metrics')
+
+
+    @defer.inlineCallbacks
+    def _vmware_get_host_perf_datastore_metrics(self, host_metrics):
+        logging.info('START: _vmware_get_host_perf_datastore_metrics')
+
+        host_systems, counter_info = yield parallelize(self.host_system_inventory, self.counter_ids)
+
+        # List of performance counter we want
+        perf_list = [
+            'datastore.read.average',
+            'datastore.write.average',
+            # 'storageAdapter.totalReadLatency.average',
+            # 'storageAdapter.totalWriteLatency.average',
+            'datastore.datastoreNormalReadLatency.latest',
+            'datastore.datastoreNormalWriteLatency.latest',
+            # 'storageAdapter.queueDepth.average'
+        ]
+
+        # logging.info("Prometheus metrics[before]: {metrics}".format(metrics=host_metrics))
+
+ #       logging.info("Preparing gauges")
+        # Prepare gauges
+        for p in perf_list:
+            p_metric = 'vmware_host_' + p.replace('.', '_')
+            host_metrics[p_metric] = GaugeMetricFamily(
+                p_metric,
+                p_metric,
+                labels=self._labelNames['host_perf_datastore'])
+            self._metricNames['host_perf_datastore'].append(p_metric)
+
+        # logging.info("Listing out metrics in the host_metrics[] array")
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+        # # logging.info("Metric names: {name}".format(name=self._metricNames['host_perf_storage']))
+
+        metrics = []
+        metric_names = {}
+        for perf_metric in perf_list:
+            perf_metric_name = 'vmware_host_' + perf_metric.replace('.', '_')
+            counter_key = counter_info[perf_metric]
+            metrics.append(vim.PerformanceManager.MetricId(
+            counterId=counter_key,
+            instance='*'
+            ))
+            metric_names[counter_key] = perf_metric_name
+
+        # logging.info("Metric names: {names}".format(names=metric_names))
+
+        # Insert custom attributes names as metric labels
+        self.updateMetricsLabelNames(host_metrics, ['host_perf_datastore'])
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+
+        specs = []
+        for host in host_systems.values():
+            if host.get('runtime.powerState') != 'poweredOn':
+                continue
+            specs.append(vim.PerformanceManager.QuerySpec(
+                maxSample=1,
+                entity=host['obj'],
+                metricId=metrics,
+                intervalId=20
+            ))
+
+        # logging.info("Specs are: {specs}".format(specs=specs))
+        content = yield self.content
+
+        if len(specs) > 0:
+            results, labels = yield parallelize(
+                threads.deferToThread(content.perfManager.QueryStats, querySpec=specs),
+                self.host_labels,
+            )
+
+            # logging.info("Labels: {labels}".format(labels=labels))
+
+            # logging.info("results: {results}".format(results=results))
+            for ent in results:
+                for metric in ent.value:
+                    # logging.info("{hostname}: {name} {value}".format(hostname=ent.entity._moId, name=metric_names[metric.id.counterId], value=metric.value))
+                    # logging.info("{hostname}: {labels}".format(hostname=ent.entity._moId, labels=labels[ent.entity._moId]))
+                    # logging.info("{hostname}: {lun}".format(hostname=ent.entity._moId, lun=metric.id.instance))
+                    host_metrics[metric_names[metric.id.counterId]].add_metric(
+                        labels[ent.entity._moId] + [metric.id.instance],
+                        float(sum(metric.value)),
+                    )
+
+        logging.info('FIN: _vmware_get_host_perf_datastore_metrics')
+
+    @defer.inlineCallbacks
+    def _vmware_get_host_perf_adapter_metrics(self, host_metrics):
+        logging.info('START: _vmware_get_host_perf_adapter_metrics')
+
+        host_systems, counter_info = yield parallelize(self.host_system_inventory, self.counter_ids)
+
+        # List of performance counter we want
+        perf_list = [
+            'storageAdapter.totalReadLatency.average',
+            'storageAdapter.totalWriteLatency.average',
+            'storageAdapter.queueDepth.average',
+            'storageAdapter.queueDepth.latest',
+            'storageAdapter.queued.latest',
+            'storageAdapter.read.average',
+            'storageAdapter.write.average',
+            'storageAdapter.maxTotalLatency.latest',
+            'storageAdapter.throughput.cont.average',
+            'storageAdapter.throughput.usag.average',
+            'storageAdapter.outstandingIOs.average',
+            'storageAdapter.queueLatency.average',
+        ]
+
+        # logging.info("Prometheus metrics[before]: {metrics}".format(metrics=host_metrics))
+
+ #       logging.info("Preparing gauges")
+        # Prepare gauges
+        for p in perf_list:
+            p_metric = 'vmware_host_' + p.replace('.', '_')
+            host_metrics[p_metric] = GaugeMetricFamily(
+                p_metric,
+                p_metric,
+                labels=self._labelNames['host_perf_adapter'])
+            self._metricNames['host_perf_adapter'].append(p_metric)
+
+        # logging.info("Listing out metrics in the host_metrics[] array")
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+        # # logging.info("Metric names: {name}".format(name=self._metricNames['host_perf_storage']))
+
+        metrics = []
+        metric_names = {}
+        for perf_metric in perf_list:
+            perf_metric_name = 'vmware_host_' + perf_metric.replace('.', '_')
+            counter_key = counter_info[perf_metric]
+            metrics.append(vim.PerformanceManager.MetricId(
+            counterId=counter_key,
+            instance='*'
+            ))
+            metric_names[counter_key] = perf_metric_name
+
+        # logging.info("Metric names: {names}".format(names=metric_names))
+
+        # Insert custom attributes names as metric labels
+        self.updateMetricsLabelNames(host_metrics, ['host_perf_adapter'])
+        # for item in host_metrics:
+        #     print("{name}: {value}".format(name=item, value=vars(host_metrics[item])))
+
+        specs = []
+        for host in host_systems.values():
+            if host.get('runtime.powerState') != 'poweredOn':
+                continue
+            specs.append(vim.PerformanceManager.QuerySpec(
+                maxSample=1,
+                entity=host['obj'],
+                metricId=metrics,
+                intervalId=20
+            ))
+
+        # logging.info("Specs are: {specs}".format(specs=specs))
+        content = yield self.content
+
+        if len(specs) > 0:
+            results, labels = yield parallelize(
+                threads.deferToThread(content.perfManager.QueryStats, querySpec=specs),
+                self.host_labels,
+            )
+
+            # logging.info("Labels: {labels}".format(labels=labels))
+
+            # logging.info("results: {results}".format(results=results))
+            for ent in results:
+                for metric in ent.value:
+                    # logging.info("{hostname}: {name} {value}".format(hostname=ent.entity._moId, name=metric_names[metric.id.counterId], value=metric.value))
+                    # logging.info("{hostname}: {labels}".format(hostname=ent.entity._moId, labels=labels[ent.entity._moId]))
+                    # logging.info("{hostname}: {lun}".format(hostname=ent.entity._moId, lun=metric.id.instance))
+                    host_metrics[metric_names[metric.id.counterId]].add_metric(
+                        labels[ent.entity._moId] + [metric.id.instance],
+                        float(sum(metric.value)),
+                    )
+
+        logging.info('FIN: _vmware_get_host_perf_adapter_metrics')
 
     @defer.inlineCallbacks
     def _vmware_get_vms(self, metrics):
